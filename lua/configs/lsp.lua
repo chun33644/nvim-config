@@ -3,7 +3,6 @@
 
 -- 依賴：mason.nvim、mason-lspconfig.nvim、nvim-lspconfig、nvim-treesitter
 -- 如果你已有自己的 nvlsp（on_attach/on_init/capabilities），把下面簡易預設換成你的
-local lspconfig = require("lspconfig")
 local mr = require("mason-registry")
 
 -- 簡易預設（建議換成你自己的）
@@ -35,7 +34,7 @@ local ensure_lang_installed = (function()
 
   -- 流程控制旗標／佇列
   local installing = false
-  local installed_langs = {}   -- ✅ 改成 set：installed_langs[lang] = true 才算處理過
+  local installed_langs = {}   -- set：installed_langs[lang] = true 才算處理過
   local installing_lang = nil
   local queued_langs = {}
 
@@ -66,20 +65,6 @@ local ensure_lang_installed = (function()
     return false
   end
 
-  -- ------------------------------------------------------------
-  -- 檢查某個 lspconfig 伺服器名稱是否存在（快取以減少 require）
-  -- ------------------------------------------------------------
-  local find_lspconfig = (function()
-    local cache = {}
-    return function(server)
-      if cache[server] ~= nil then return cache[server] end
-      local ok, mod = pcall(require, "lspconfig")
-      if not ok then cache[server] = nil; return nil end
-      cache[server] = mod[server] and true or nil
-      return cache[server]
-    end
-  end)()
-
   ---@alias PackageType "lspconfig"|"mason"|"mason-lspconfig"|"treesitter"
 
   -- ------------------------------------------------------------
@@ -90,28 +75,22 @@ local ensure_lang_installed = (function()
   local function parse_name(name)
     local parts = vim.split(name, "/")
 
+    local map = require("mason-lspconfig").get_mappings()
+    local parsers = require("nvim-treesitter.parsers").get_parser_configs()
+
     if #parts == 1 then
-      -- 單字：先看是不是 lspconfig server
-      if find_lspconfig(name) then
-        local map = require("mason-lspconfig").get_mappings()
-        if map.lspconfig_to_package[name] then
-          return "mason-lspconfig", map.lspconfig_to_package[name]
-        end
-        return "lspconfig", name
+      -- 單字：優先透過 mason-lspconfig 映射，然後 treesitter，最後當成「LSP server 名稱」
+      if map.lspconfig_to_package[name] then
+        return "mason-lspconfig", map.lspconfig_to_package[name]
       end
-      -- 再看是不是 mason 套件對應 lspconfig
-      do
-        local map = require("mason-lspconfig").get_mappings()
-        if map.package_to_lspconfig[name] then
-          return "mason-lspconfig", name
-        end
+      if map.package_to_lspconfig[name] then
+        return "mason-lspconfig", name
       end
-      -- treesitter parser 名稱
-      if require("nvim-treesitter.parsers").get_parser_configs()[name] then
+      if parsers[name] then
         return "treesitter", name
       end
-      -- 其他的一律當 mason 套件名稱
-      return "mason", name
+      -- fallback：視為 LSP server 名稱（走新 API vim.lsp.config）
+      return "lspconfig", name
     end
 
     -- 明確前綴
@@ -119,14 +98,12 @@ local ensure_lang_installed = (function()
     if #parts == 2 then
       local t = type_matches[parts[1]]
       if not t then error(("Invalid package type in '%s'"):format(name)) end
-      if t == "lspconfig" and not find_lspconfig(parts[2]) then
-        error(("Invalid lspconfig server '%s'"):format(parts[2]))
-      end
-      if t == "treesitter" and not require("nvim-treesitter.parsers").get_parser_configs()[parts[2]] then
+
+      if t == "treesitter" and not parsers[parts[2]] then
         error(("Invalid treesitter parser '%s'"):format(parts[2]))
       end
+
       -- 前綴若可透過映射轉成 mason-lspconfig，就轉
-      local map = require("mason-lspconfig").get_mappings()
       if t == "lspconfig" and map.lspconfig_to_package[parts[2]] then
         return "mason-lspconfig", map.lspconfig_to_package[parts[2]]
       end
@@ -169,17 +146,23 @@ local ensure_lang_installed = (function()
         end
 
         if t == "lspconfig" then
-          -- 若前面有 mason 要裝，則先延後 setup
+          -- 新 API：vim.lsp.config + vim.lsp.enable
           local function setup()
-            lspconfig[name].setup {
+            -- 這裡的 name 是 LSP server 名稱（例如 "clangd"）
+            vim.lsp.config(name, {
               on_attach = nvlsp.on_attach,
               on_init = nvlsp.on_init,
               capabilities = nvlsp.capabilities,
-            }
+            })
+            -- 啟用這個 config，讓它對應的 filetypes 自動 attach
+            vim.lsp.enable({ name })
           end
+
+          -- 若前面有 mason/treesitter 要裝，則先延後 setup
           if #queued_pkgs > 0 then
             return { type = "lspconfig", name = name, setup = setup }
           end
+          -- 沒東西在佇列就直接 setup
           setup()
           return
         end
@@ -207,11 +190,10 @@ local ensure_lang_installed = (function()
     if #queued_pkgs == 0 then if cb then cb() end; return end
     if lang ~= "*" then show("[LSP] [0/%d] Installing for %s...", #queued_pkgs, lang) end
 
-    -- 逐項安裝：Treesitter → Mason → lspconfig
+    -- 逐項安裝：Treesitter → Mason → LSP config
     local function install_pkg(i)
       if i > #queued_pkgs then
-        -- 全部跑完啟動 LSP
-        vim.cmd("LspStart")
+        -- 全部跑完就結束（vim.lsp.enable 已經在上面呼叫過了）
         if cb then cb() end
         return
       end
@@ -238,9 +220,9 @@ local ensure_lang_installed = (function()
         return vim.defer_fn(poll, 100)
       end
 
-      -- 2) lspconfig：直接 setup（若被延後則此時執行）
+      -- 2) LSP config：執行延後的 setup（裡面會呼叫 vim.lsp.config + enable）
       if desc.type == "lspconfig" then
-        show("[LSP] [%d/%d] lspconfig setup %s", i, #queued_pkgs, desc.name)
+        show("[LSP] [%d/%d] LSP config %s", i, #queued_pkgs, desc.name)
         if desc.setup then desc.setup() end
         return vim.schedule(function() install_pkg(i + 1) end)
       end
@@ -250,7 +232,7 @@ local ensure_lang_installed = (function()
       show("[LSP] [%d/%d] Mason install %s%s", i, #queued_pkgs, pkg.name, lang=="*" and "" or (" for "..lang))
       pkg:install({}, function(success)
         if success then
-          installed_langs[lang] = true    -- ✅ 成功才標記（修正原本失敗也標記的問題）
+          installed_langs[lang] = true    -- 成功才標記（修正原本失敗也標記的問題）
           show("[LSP] [%d/%d] Installed %s", i, #queued_pkgs, pkg.name)
         else
           show_error("[LSP] [%d/%d] Failed %s", i, #queued_pkgs, pkg.name)
@@ -319,4 +301,3 @@ ensure_lang_installed("*")
 for _, lang in ipairs(eagerly_installed_langs) do
   ensure_lang_installed(lang)
 end
-
